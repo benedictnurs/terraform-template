@@ -6,7 +6,7 @@ apt-get install -y docker.io docker-compose
 
 # seed sql
 cat > /tmp/seed.sql <<'EOSQL'
-${file("${path.module}/seed.sql")}
+${seed_sql_content}
 EOSQL
 
 cat > /root/docker-compose.yml <<EOF

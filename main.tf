@@ -17,8 +17,7 @@ terraform {
     }
     random = {
       source  = "hashicorp/random"
-      # NOTE: Updated version constraint to ensure random_secret is available.
-      version = "~> 3.1"
+      version = "~> 3.0"
     }
   }
 }
@@ -36,6 +35,21 @@ variable "region" { type = string }        # e.g. "us-ashburn-1"
 variable "compartment_ocid" { type = string } # usually your root compartment OCID
 variable "ssh_public_key" { type = string }   # file("~/.ssh/id_rsa.pub")
 
+# NOTE: Added variables for the new user's credentials.
+variable "vm_username" {
+  type        = string
+  description = "The username for the new user on the VM."
+  default     = "user"
+}
+
+variable "vm_password" {
+  type        = string
+  description = "The password for the new user on the VM."
+  default     = "password"
+  sensitive   = true
+}
+
+
 ################ Cloudflare  ################
 variable "cf_api_token" { type = string }
 variable "cf_account_id" { type = string }
@@ -43,10 +57,19 @@ variable "cf_zone_id" { type = string } # "" if no custom domain
 variable "domain" { type = string }     # "" for tunnel URL only
 
 ################ GitHub / Docker  ################
-variable "github_token" { type = string } # PAT: repo + write:packages
+variable "github_token" {
+  type        = string
+  description = "PAT with read:packages and write:packages scopes."
+  sensitive   = true
+}
 variable "github_owner" { type = string }
 variable "repo_name" { type = string }
 variable "docker_image" { type = string } # ghcr.io/<owner>/<repo>:latest
+variable "seed_sql_path" {
+  type    = string
+  default = "seed.sql"
+}
+
 
 ################################
 # Provider Configuration
@@ -77,6 +100,7 @@ resource "oci_core_vcn" "vcn" {
   compartment_id = var.compartment_ocid
   cidr_block     = "10.0.0.0/16"
   display_name   = "backend-vcn"
+  dns_label      = "backendvcn"
 }
 
 resource "oci_core_internet_gateway" "igw" {
@@ -109,16 +133,15 @@ resource "oci_core_subnet" "subnet" {
 ################################
 # Cloudflare Tunnel + DNS
 ################################
-# NOTE: Replaced random_password with random_secret to generate a correctly
-# formatted secret for the Cloudflare Tunnel.
-resource "random_secret" "tunnel_secret" {
-  length = 32
+resource "random_password" "tunnel_secret" {
+  length  = 32
+  special = false
 }
 
 resource "cloudflare_tunnel" "backend" {
   account_id = var.cf_account_id
   name       = "oci-backend"
-  secret     = random_secret.tunnel_secret.b64_std
+  secret     = base64encode(random_password.tunnel_secret.result)
 }
 
 resource "cloudflare_record" "api_dns" {
@@ -126,7 +149,7 @@ resource "cloudflare_record" "api_dns" {
   zone_id = var.cf_zone_id
   name    = "api"
   type    = "CNAME"
-  value   = "${cloudflare_tunnel.backend.id}.cfargotunnel.com"
+  content = "${cloudflare_tunnel.backend.id}.cfargotunnel.com"
   proxied = true
 }
 
@@ -134,12 +157,34 @@ resource "cloudflare_record" "api_dns" {
 # User-data (rendered with built-in templatefile)
 ################################
 locals {
-  # NOTE: Added the 'path' variable required by user_data.tpl.
-  user_data_rendered = templatefile("${path.module}/user_data.tpl", {
-    DOCKER_IMAGE = var.docker_image
-    TUNNEL_TOKEN = cloudflare_tunnel.backend.tunnel_token
-    path         = path.module
-  })
+  # NOTE: Added a 'docker login' command to authenticate with GHCR before pulling the image.
+  user_data_script = <<-EOT
+    #!/bin/bash
+    set -e # Exit immediately if a command exits with a non-zero status.
+
+    # Create new user and set password
+    useradd -m -s /bin/bash ${var.vm_username}
+    echo '${var.vm_username}:${var.vm_password}' | chpasswd
+    usermod -aG sudo ${var.vm_username}
+
+    # Install Docker
+    apt-get update -y
+    apt-get install -y docker.io
+    systemctl start docker
+    systemctl enable docker
+
+    # Install Cloudflare Tunnel
+    wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+    dpkg -i cloudflared-linux-amd64.deb
+    cloudflared service install ${cloudflare_tunnel.backend.tunnel_token}
+    systemctl start cloudflared
+
+    # Securely log in to GitHub Container Registry
+    echo "${var.github_token}" | docker login ghcr.io -u "${var.github_owner}" --password-stdin
+
+    # Run the application Docker container
+    docker run -d --restart=always -p 8080:8080 ${var.docker_image}
+  EOT
 }
 
 ################################
@@ -171,13 +216,12 @@ resource "oci_core_instance" "vm" {
 
   metadata = {
     ssh_authorized_keys = var.ssh_public_key
-    user_data           = base64encode(local.user_data_rendered)
+    user_data           = base64encode(local.user_data_script)
   }
 
   source_details {
     source_type = "image"
-    # NOTE: Corrected to reference the image from the list returned by the data source.
-    image_id = data.oci_core_images.ubuntu.images[0].id
+    source_id   = data.oci_core_images.ubuntu.images[0].id
   }
 }
 
@@ -192,6 +236,7 @@ locals {
         branches: [main]
     permissions:
       contents: read
+      # NOTE: 'write:packages' includes read permissions.
       packages: write
     jobs:
       build:
@@ -206,6 +251,8 @@ locals {
               password: $${{ secrets.GHCR_TOKEN }}
           - uses: docker/build-push-action@v5
             with:
+              context: ./backend
+              file: ./backend/Dockerfile
               push: true
               tags: ${var.docker_image}
   YAML
