@@ -35,7 +35,6 @@ variable "region" { type = string }        # e.g. "us-ashburn-1"
 variable "compartment_ocid" { type = string } # usually your root compartment OCID
 variable "ssh_public_key" { type = string }   # file("~/.ssh/id_rsa.pub")
 
-# NOTE: Added variables for the new user's credentials.
 variable "vm_username" {
   type        = string
   description = "The username for the new user on the VM."
@@ -65,11 +64,6 @@ variable "github_token" {
 variable "github_owner" { type = string }
 variable "repo_name" { type = string }
 variable "docker_image" { type = string } # ghcr.io/<owner>/<repo>:latest
-variable "seed_sql_path" {
-  type    = string
-  default = "seed.sql"
-}
-
 
 ################################
 # Provider Configuration
@@ -103,12 +97,14 @@ resource "oci_core_vcn" "vcn" {
   dns_label      = "backendvcn"
 }
 
+# Internet Gateway
 resource "oci_core_internet_gateway" "igw" {
   compartment_id = var.compartment_ocid
   vcn_id         = oci_core_vcn.vcn.id
   display_name   = "igw"
 }
 
+# Route Table
 resource "oci_core_route_table" "rt" {
   compartment_id = var.compartment_ocid
   vcn_id         = oci_core_vcn.vcn.id
@@ -120,6 +116,7 @@ resource "oci_core_route_table" "rt" {
   }
 }
 
+# Subnet
 resource "oci_core_subnet" "subnet" {
   compartment_id             = var.compartment_ocid
   vcn_id                     = oci_core_vcn.vcn.id
@@ -138,6 +135,7 @@ resource "random_password" "tunnel_secret" {
   special = false
 }
 
+# Creates a Cloudflare Tunnel resource
 resource "cloudflare_tunnel" "backend" {
   account_id = var.cf_account_id
   name       = "oci-backend"
@@ -149,40 +147,53 @@ resource "cloudflare_record" "api_dns" {
   zone_id = var.cf_zone_id
   name    = "api"
   type    = "CNAME"
-  content = "${cloudflare_tunnel.backend.id}.cfargotunnel.com"
+  content = cloudflare_tunnel.backend.cname
   proxied = true
+}
+
+# Added a resource to configure the tunnel's routing.
+# This replaces the need to add a "Public Hostname" in the Cloudflare UI.
+resource "cloudflare_tunnel_config" "backend_config" {
+  account_id = var.cf_account_id
+  tunnel_id  = cloudflare_tunnel.backend.id
+
+  config {
+    ingress_rule {
+      hostname = "api.seshon.tech"
+      service  = "http://localhost:8080"
+    }
+
+    # If does not match any hostname, return a 404 error
+    ingress_rule {
+      service = "http_status:404"
+    }
+  }
 }
 
 ################################
 # User-data (rendered with built-in templatefile)
 ################################
 locals {
-  # NOTE: Added a 'docker login' command to authenticate with GHCR before pulling the image.
   user_data_script = <<-EOT
     #!/bin/bash
-    set -e # Exit immediately if a command exits with a non-zero status.
+    set -e 
 
-    # Create new user and set password
     useradd -m -s /bin/bash ${var.vm_username}
     echo '${var.vm_username}:${var.vm_password}' | chpasswd
     usermod -aG sudo ${var.vm_username}
 
-    # Install Docker
     apt-get update -y
     apt-get install -y docker.io
     systemctl start docker
     systemctl enable docker
 
-    # Install Cloudflare Tunnel
     wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
     dpkg -i cloudflared-linux-amd64.deb
     cloudflared service install ${cloudflare_tunnel.backend.tunnel_token}
     systemctl start cloudflared
 
-    # Securely log in to GitHub Container Registry
     echo "${var.github_token}" | docker login ghcr.io -u "${var.github_owner}" --password-stdin
 
-    # Run the application Docker container
     docker run -d --restart=always -p 8080:8080 ${var.docker_image}
   EOT
 }
@@ -236,7 +247,6 @@ locals {
         branches: [main]
     permissions:
       contents: read
-      # NOTE: 'write:packages' includes read permissions.
       packages: write
     jobs:
       build:
