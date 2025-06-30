@@ -30,24 +30,10 @@ terraform {
 variable "tenancy_ocid" { type = string }
 variable "user_ocid" { type = string }
 variable "fingerprint" { type = string }
-variable "private_key_path" { type = string }
-variable "region" { type = string }
-variable "compartment_ocid" { type = string }
+variable "private_key_path" { type = string } # PEM file for OCI API
+variable "region" { type = string }        # e.g. "us-ashburn-1"
+variable "compartment_ocid" { type = string } # usually your root compartment OCID
 variable "ssh_public_key" { type = string }
-
-variable "vm_username" {
-  type        = string
-  description = "The username for the new user on the VM."
-  default     = "user"
-}
-
-variable "vm_password" {
-  type        = string
-  description = "The password for the new user on the VM."
-  default     = "password"
-  sensitive   = true
-}
-
 
 ################ Cloudflare  ################
 variable "cf_api_token" { type = string }
@@ -64,6 +50,11 @@ variable "github_token" {
 variable "github_owner" { type = string }
 variable "repo_name" { type = string }
 variable "docker_image" { type = string } # ghcr.io/<owner>/<repo>:latest
+variable "seed_sql_path" {
+  type    = string
+  default = "seed.sql"
+}
+
 
 ################################
 # Provider Configuration
@@ -88,6 +79,40 @@ provider "github" {
 provider "random" {}
 
 ################################
+# Local Variables
+################################
+locals {
+  user_data_script = <<-EOT
+    #!/bin/bash
+    set -e 
+
+    # Install Docker
+    apt-get update -y
+    apt-get install -y docker.io
+    systemctl start docker
+    systemctl enable docker
+
+    # Install PostgreSQL
+    apt-get install -y postgresql postgresql-contrib
+    systemctl start postgresql
+    systemctl enable postgresql
+    
+    # Install Cloudflare Tunnel
+    wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+    dpkg -i cloudflared-linux-amd64.deb
+    cloudflared service install ${cloudflare_zero_trust_tunnel_cloudflared.backend.tunnel_token}
+    systemctl start cloudflared
+
+    # Securely log in to GitHub Container Registry
+    echo "${var.github_token}" | docker login ghcr.io -u "${var.github_owner}" --password-stdin
+
+    # Run the application Docker container
+    docker run -d --restart=always -p 8080:8080 ${var.docker_image}
+  EOT
+}
+
+
+################################
 # Networking (VCN + Subnet + IGW)
 ################################
 resource "oci_core_vcn" "vcn" {
@@ -97,14 +122,12 @@ resource "oci_core_vcn" "vcn" {
   dns_label      = "backendvcn"
 }
 
-# Internet Gateway
 resource "oci_core_internet_gateway" "igw" {
   compartment_id = var.compartment_ocid
   vcn_id         = oci_core_vcn.vcn.id
   display_name   = "igw"
 }
 
-# Route Table
 resource "oci_core_route_table" "rt" {
   compartment_id = var.compartment_ocid
   vcn_id         = oci_core_vcn.vcn.id
@@ -116,7 +139,6 @@ resource "oci_core_route_table" "rt" {
   }
 }
 
-# Subnet
 resource "oci_core_subnet" "subnet" {
   compartment_id             = var.compartment_ocid
   vcn_id                     = oci_core_vcn.vcn.id
@@ -135,7 +157,6 @@ resource "random_password" "tunnel_secret" {
   special = false
 }
 
-# Creates a Cloudflare Tunnel resource
 resource "cloudflare_zero_trust_tunnel_cloudflared" "backend" {
   account_id = var.cf_account_id
   name       = "oci-backend"
@@ -151,8 +172,6 @@ resource "cloudflare_record" "api_dns" {
   proxied = true
 }
 
-# Added a resource to configure the tunnel's routing.
-# This replaces the need to add a "Public Hostname" in the Cloudflare UI.
 resource "cloudflare_zero_trust_tunnel_cloudflared_config" "backend_config" {
   account_id = var.cf_account_id
   tunnel_id  = cloudflare_zero_trust_tunnel_cloudflared.backend.id
@@ -162,40 +181,10 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "backend_config" {
       hostname = "api.seshon.tech"
       service  = "http://localhost:8080"
     }
-
-    # If does not match any hostname, return a 404 error
     ingress_rule {
       service = "http_status:404"
     }
   }
-}
-
-################################
-# User-data (rendered with built-in templatefile)
-################################
-locals {
-  user_data_script = <<-EOT
-    #!/bin/bash
-    set -e 
-
-    useradd -m -s /bin/bash ${var.vm_username}
-    echo '${var.vm_username}:${var.vm_password}' | chpasswd
-    usermod -aG sudo ${var.vm_username}
-
-    apt-get update -y
-    apt-get install -y docker.io
-    systemctl start docker
-    systemctl enable docker
-
-    wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-    dpkg -i cloudflared-linux-amd64.deb
-    cloudflared service install ${cloudflare_zero_trust_tunnel_cloudflared.backend.tunnel_token}
-    systemctl start cloudflared
-
-    echo "${var.github_token}" | docker login ghcr.io -u "${var.github_owner}" --password-stdin
-
-    docker run -d --restart=always -p 8080:8080 ${var.docker_image}
-  EOT
 }
 
 ################################
