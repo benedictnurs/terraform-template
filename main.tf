@@ -136,7 +136,7 @@ resource "random_password" "tunnel_secret" {
 }
 
 # Creates a Cloudflare Tunnel resource
-resource "cloudflare_tunnel" "backend" {
+resource "cloudflare_zero_trust_tunnel_cloudflared" "backend" {
   account_id = var.cf_account_id
   name       = "oci-backend"
   secret     = base64encode(random_password.tunnel_secret.result)
@@ -147,15 +147,15 @@ resource "cloudflare_record" "api_dns" {
   zone_id = var.cf_zone_id
   name    = "api"
   type    = "CNAME"
-  content = cloudflare_tunnel.backend.cname
+  content = cloudflare_zero_trust_tunnel_cloudflared.backend.cname
   proxied = true
 }
 
 # Added a resource to configure the tunnel's routing.
 # This replaces the need to add a "Public Hostname" in the Cloudflare UI.
-resource "cloudflare_tunnel_config" "backend_config" {
+resource "cloudflare_zero_trust_tunnel_cloudflared_config" "backend_config" {
   account_id = var.cf_account_id
-  tunnel_id  = cloudflare_tunnel.backend.id
+  tunnel_id  = cloudflare_zero_trust_tunnel_cloudflared.backend.id
 
   config {
     ingress_rule {
@@ -189,7 +189,7 @@ locals {
 
     wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
     dpkg -i cloudflared-linux-amd64.deb
-    cloudflared service install ${cloudflare_tunnel.backend.tunnel_token}
+    cloudflared service install ${cloudflare_zero_trust_tunnel_cloudflared.backend.tunnel_token}
     systemctl start cloudflared
 
     echo "${var.github_token}" | docker login ghcr.io -u "${var.github_owner}" --password-stdin
@@ -287,5 +287,5 @@ resource "github_actions_secret" "ghcr" {
 # Outputs
 ################################
 output "public_ip" { value = oci_core_instance.vm.public_ip }
-output "tunnel_url" { value = "${cloudflare_tunnel.backend.id}.cfargotunnel.com" }
+output "tunnel_url" { value = "${cloudflare_zero_trust_tunnel_cloudflared.backend.id}.cfargotunnel.com" }
 output "pretty_url" { value = try(cloudflare_record.api_dns[0].hostname, "") }
