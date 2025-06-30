@@ -187,6 +187,10 @@ locals {
     systemctl start docker
     systemctl enable docker
 
+    apt-get install -y postgresql postgresql-contrib
+    systemctl start postgresql
+    systemctl enable postgresql
+
     wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
     dpkg -i cloudflared-linux-amd64.deb
     cloudflared service install ${cloudflare_zero_trust_tunnel_cloudflared.backend.tunnel_token}
@@ -241,7 +245,7 @@ resource "oci_core_instance" "vm" {
 ################################
 locals {
   ci_workflow = <<-YAML
-    name: Build & Push Docker
+    name: Build & Deploy Backend
     on:
       push:
         branches: [main]
@@ -250,6 +254,7 @@ locals {
       packages: write
     jobs:
       build:
+        name: Build Docker Image
         runs-on: ubuntu-latest
         steps:
           - uses: actions/checkout@v4
@@ -257,14 +262,32 @@ locals {
           - uses: docker/login-action@v3
             with:
               registry: ghcr.io
-              username: ${var.github_owner}
+              username: $${{ secrets.GITHUB_OWNER }}
               password: $${{ secrets.GHCR_TOKEN }}
           - uses: docker/build-push-action@v5
             with:
               context: ./backend
               file: ./backend/Dockerfile
               push: true
-              tags: ${var.docker_image}
+              tags: $${{ secrets.DOCKER_IMAGE }}
+
+      deploy:
+        name: Deploy to OCI
+        needs: build
+        runs-on: ubuntu-latest
+        steps:
+          - name: SSH and Deploy
+            uses: appleboy/ssh-action@master
+            with:
+              host: $${{ secrets.DEPLOY_HOST }}
+              username: $${{ secrets.DEPLOY_USER }}
+              key: $${{ secrets.DEPLOY_KEY }}
+              script: |
+                echo $${{ secrets.GHCR_TOKEN }} | sudo docker login ghcr.io -u $${{ secrets.GITHUB_OWNER }} --password-stdin
+                sudo docker pull $${{ secrets.DOCKER_IMAGE }}
+                sudo docker stop backend-app || true
+                sudo docker rm backend-app || true
+                sudo docker run -d --restart=always --name backend-app -p 8080:8080 $${{ secrets.DOCKER_IMAGE }}
   YAML
 }
 
@@ -281,6 +304,12 @@ resource "github_actions_secret" "ghcr" {
   repository      = var.repo_name
   secret_name     = "GHCR_TOKEN"
   plaintext_value = var.github_token
+}
+
+resource "github_actions_secret" "github_owner" {
+  repository      = var.repo_name
+  secret_name     = "GITHUB_OWNER"
+  plaintext_value = var.github_owner
 }
 
 ################################
